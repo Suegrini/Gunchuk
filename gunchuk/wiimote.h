@@ -27,27 +27,49 @@
  * necessary.  Just use a current version of the Arduino development
  * environment.
  */
-
+ /* Modified to work with Gunchuk extension */
+ 
 #ifndef __WIIMOTE_H__
 #define __WIIMOTE_H__
 
 #if defined(ARDUINO) && ARDUINO >= 100
   #include "Arduino.h"
-  #else
+#else
   #include "WProgram.h"
-  #endif
-#include "Wire.h"
+#endif
+
+#include <Wire.h>
 #include "wm_crypto.h"
+#include "config.h"
 
-// Identification sequence for Classic Controller
-static byte idbuf[] = { 0x00, 0x00, 0xa4, 0x20, 0x01, 0x01 };
+const int SDA0 = 0;
+const int SCL0 = 1;
+const int SDA1 = 26;
+const int SCL1 = 27;
 
-// Classic Controller calibration data
-byte calbuf[] = { 0xFC, 0x04, 0x7E, 0xFC, 0x04, 0x7E, 0xFC, 0x04, 0x7E,
-		0xFC, 0x04, 0x7E, 0x00, 0x00, 0x00, 0x00 }; // Checksum will be calculated later...
+// Identification sequence for Gunchuck.
+static byte idbuf[] = { 0x00, 0x00, 0xa4, 0x20, 0x67, 0x67 };
 
-//byte calbuf[] = { 0xff, 0x00, 0x80, 0xff, 0x00, 0x80, 0xff, 0x00, 0x80, 0xff,
-//		0x00, 0x80, 0x00, 0x00, 0x51, 0xa6 }; // Homebrews (libogc) don't seem to like this one...
+// Gunchuck calibration data. Include 'ideal' calibration values for nunchuk accelerometer.
+static byte calbuf[16] = { 0x7F, 0x7F, 0x7F, 0x00, 0xB4, 0xB4, 0xB4, 0x00, 0xFF, 0x00, 0x7F, 0xFF, 0x00, 0x7F };  // Checksum will be calculated later...
+
+// Gunchuck analog stick. Initialized to calibration values.
+static byte sx = 0x7F;
+static byte sy = 0x7F;
+
+// Nunchuk accelerometers. Initialized to calibration values.
+static byte accelX = 0x80;
+static byte accelY = 0x80;
+static byte accelZ = 0x80;
+
+// Gunchuck button state.
+static bool buttonStates[13];
+
+// Gunchuck outputs state.
+static bool outputStates[4];
+
+// Receiving nunchuk data.
+static bool nunchukReady = false;
 
 static byte outbuf[6];
 static byte *curbuf = outbuf;
@@ -66,7 +88,7 @@ static byte crypt_setup_done = 0;
  * eight or more bytes to the Wiimote, this callback will be
  * invoked several times.
  */
-void (*wiimote_receive)(byte offset, byte count) = NULL;
+static void (*wiimote_receive)(byte offset, byte count) = NULL;
 
 /*
  * Callback for streaming bytes from the Arduino to the Wiimote.
@@ -89,20 +111,19 @@ void (*wiimote_receive)(byte offset, byte count) = NULL;
  * seem awkward, but it minimizes delays in I2C communication, and
  * in most cases an all-zero initial buffer is not a problem.)
  */
-byte *(*wiimote_stream)(byte *buffer) = NULL;
+static byte *(*wiimote_stream)(byte *buffer) = NULL;
 
 /*
  * Global array for storing and accessing register values written
  * by the Wiimote.  Those are the 256 registers corresponding to
  * the Extension, starting at 04a40000.
  */
-byte wiimote_registers[0x100];
+static byte wiimote_registers[0x100];
 
 /*
  * Start Wiimote <-> Extension communication encryption,
  * if requested by the application.
  */
-
 static void setup_encryption() {
 	int i;
 
@@ -117,6 +138,27 @@ static void setup_encryption() {
 	wm_gentabs();
 
 	crypt_setup_done = 1;
+}
+
+/*
+ * Set calibration data on Wiimote registers.
+ * Calibration data is stored in addresses 0x20 and 0x30.
+ */
+static void set_caldata(byte caldata[16] = calbuf) {
+	byte calchecksum = 0;
+  
+  // Fix calibration data checksum, just in case...
+	for(int i = 0; i < 14; i++) {
+		calchecksum += calbuf[i];
+	}
+	caldata[14] = calchecksum + 0x55;
+	caldata[15] = calchecksum + 0xAA;
+
+	// Set calibration data on registers
+	for (int i = 0x20; i <= 0x2F; i++) {
+		wiimote_registers[i] = caldata[i - 0x20]; // 0x20
+		wiimote_registers[i + 0x10] = caldata[i - 0x20]; // 0x30
+	}
 }
 
 /*
@@ -175,7 +217,8 @@ static void receive_bytes(int count) {
 			wiimote_receive(addr, (byte) count - 1);
 		}
 	}
-
+  if (state != 0)
+    Serial.println(state);
 	// Setup encryption
 	if (crypt_keys_received) {
 		setup_encryption();
@@ -204,6 +247,19 @@ static void handle_request() {
 
 		break;
 
+	case 0x20:
+	case 0x30:
+		if(last_state == state) {
+			offset += 8;
+      last_state = 0xFF;
+		} else {
+			last_state = state;
+			offset = 0;
+		}
+    Serial.println(offset);
+		send_data(wiimote_registers + state + offset, 8, state + offset);
+		break;
+
 	default:
 		if(last_state == state) {
 			offset += 8;
@@ -226,7 +282,7 @@ static void handle_request() {
  * Make sure to read the documentation of wiimote_stream if you
  * intend to use both wiimote_stream and this function.
  */
-void wiimote_set_byte(int index, byte value) {
+static void wiimote_set_byte(int index, byte value) {
 	curbuf[index] = value;
 }
 
@@ -242,7 +298,7 @@ void wiimote_set_byte(int index, byte value) {
  * Make sure to read the documentation of wiimote_stream if you
  * intend to use both wiimote_stream and this function.
  */
-byte *wiimote_swap_buffers(byte *buffer) {
+static byte *wiimote_swap_buffers(byte *buffer) {
 	byte *tmp = curbuf;
 	curbuf = buffer;
 	return tmp;
@@ -252,40 +308,30 @@ byte *wiimote_swap_buffers(byte *buffer) {
  * Takes joystick, and button values and encodes them
  * into a buffer.
  *
- * Classic Controller
- *
  * Buffer encoding details:
  * http://wiibrew.org/wiki/Wiimote/Extension_Controllers/Classic_Controller
  */
-void wiimote_write_buffer(byte *buffer, int bdl, int bdr, int bdu, int bdd,
-		int ba, int bb, int bx, int by, int blt, int brt, int bminus, int bplus,
-		int bhome, byte lx, byte ly, byte rx, byte ry, int bzl, int bzr) {
+static void wiimote_write_buffer(byte *buffer) {
+	buffer[0] = (accelZ & 0xC0) | (sx >> 2);
+	buffer[1] = ((accelZ & 0x30) << 2) | (sy >> 2);
+	buffer[2] = ((accelZ & 0x08) << 4) | (accelX >> 1);
+	buffer[3] = ((accelZ & 0x04) << 5) | (accelY >> 1);
 
-	buffer[0] = ((rx & 0x18) << 3) | (lx & 0x3F);
-	buffer[1] = ((rx & 0x06) << 5) | (ly & 0x3F);
-	buffer[2] = ((rx & 0x01) << 7) | (ry & 0x1F);
-	buffer[3] = 0x00;
+	buffer[4] = (buttonStates[5] << 7) | (buttonStates[7] << 6) | (nunchukReady << 5) | (buttonStates[8] << 4) | 
+      (buttonStates[9] << 3) | (buttonStates[10] << 2) | (accelZ & 0x02);
 
-	buffer[4] = ((bdr ? 1 : 0) << 7) | ((bdd ? 1 : 0) << 6) | ((blt ? 1 : 0)
-			<< 5) | ((bminus ? 1 : 0) << 4) | ((bplus ? 1 : 0) << 2)
-			| ((brt ? 1 : 0) << 1) | ((bhome ? 1 : 0) << 3);
+	buffer[5] = buttonStates[12] << 7 | (buttonStates[1] << 6) | (buttonStates[3] << 5) | (buttonStates[0] << 4) | 
+      (buttonStates[2] << 3) | buttonStates[11] << 2 | (buttonStates[4] << 1) | buttonStates[6];
 
-	buffer[5] = ((bb ? 1 : 0) << 6) | ((by ? 1 : 0) << 5) | ((ba ? 1 : 0)
-			<< 4) | ((bx ? 1 : 0) << 3) | ((bdl ? 1 : 0) << 1) | (bdu ? 1
-			: 0) | ((bzl ? 1 : 0) << 7) | ((bzr ? 1 : 0) << 2);
-
-	buffer[4] = ~buffer[4];
+	buffer[4] ^= 0x3F;
 	buffer[5] = ~buffer[5];
 }
-
 
 /*
  * Initializes Wiimote connection. Call this function in your
  * setup function.
  */
-void wiimote_init() {
-	byte calchecksum = 0;
-
+static void wiimote_init() {
 	memset(wiimote_registers, 0xFF, 0x100);
 
 	// Set extension id on registers
@@ -293,32 +339,24 @@ void wiimote_init() {
 		wiimote_registers[i] = idbuf[i - 0xFA];
 	}
 
-	// Fix calibration data checksum, just in case...
-	for(int i = 0; i < 14; i++) {
-		calchecksum += calbuf[i];
-	}
-	calbuf[14] = calchecksum + 0x55;
-	calbuf[15] = calchecksum + 0xAA;
-
-	// Set calibration data on registers
-	for (int i = 0x20; i <= 0x2F; i++) {
-		wiimote_registers[i] = calbuf[i - 0x20]; // 0x20
-		wiimote_registers[i + 0x10] = calbuf[i - 0x20]; // 0x30
-	}
+  // Set calibration data on registers
+	set_caldata();
 
 	// Initialize curbuf, otherwise, "Up+Right locked" bug...
-	wiimote_write_buffer(curbuf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, calbuf[2]>>2, calbuf[5]>>2, calbuf[8]>>3, calbuf[11]>>3, 0, 0);
+	wiimote_write_buffer(curbuf);
 
 	// Encryption disabled by default
 	wiimote_registers[0xF0] = 0x55;
 	wiimote_registers[0xFB] = 0x00;
 
+  Wire.setSDA(SDA0);
+  Wire.setSCL(SCL0);
+  
 	// Join I2C bus
 	Wire.begin(0x52);
 
 	Wire.onReceive(receive_bytes);
 	Wire.onRequest(handle_request);
 }
-
 
 #endif
